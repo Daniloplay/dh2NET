@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: dh2net
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python dh2_render_server.py
+    envVars:
+      - key: DH2_PUBLIC_HOST
+        value: dh2net.onrender.com
