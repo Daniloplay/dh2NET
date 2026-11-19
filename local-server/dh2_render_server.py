@@ -430,12 +430,12 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
             elif pkt_type == 6 and len(req) >= 22:
                 seq, _ack, _bits, matching_id, _conn_id = struct.unpack("<HHIHH", req[8:20])
                 sender_mid = my_mid or matching_id
-                msg_data = req[22:]
+                msg_data = req[21:]
                 if len(msg_data) > 1 or (len(msg_data) == 1 and msg_data[0] != 0):
                     for tid, tws in list(RELAY_SOCKETS.items()):
                         if tid != sender_mid:
                             RELAY_SEQ = (RELAY_SEQ + 1) & 0xFFFF or 1
-                            fwd_pl = struct.pack("<HHIHHBB", RELAY_SEQ, 0, 0xFFFFFFFF, 1, tid, req[20], 0) + msg_data
+                            fwd_pl = struct.pack("<HHIHHB", RELAY_SEQ, 0, 0xFFFFFFFF, 1, tid, req[20]) + msg_data
                             await tws.send_bytes(b"\xe5\xbe\x00\xb0" + struct.pack("<HBB", 8 + len(fwd_pl), 6, 0) + fwd_pl)
                 RELAY_SEQ = (RELAY_SEQ + 1) & 0xFFFF or 1
                 ack_pl = struct.pack("<HHIHHBB", RELAY_SEQ, seq, 0xFFFFFFFF, 1, sender_mid, 0, 0)
