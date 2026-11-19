@@ -438,7 +438,7 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                             fwd_pl = struct.pack("<HHIHHB", RELAY_SEQ, 0, 0, sender_mid, tid, req[20]) + msg_data
                             await tws.send_bytes(b"\xe5\xbe\x00\xb0" + struct.pack("<HBB", 8 + len(fwd_pl), 6, 0) + fwd_pl)
                 RELAY_SEQ = (RELAY_SEQ + 1) & 0xFFFF or 1
-                ack_pl = struct.pack("<HHIHHBB", RELAY_SEQ, seq, 0xFFFFFFFF, 1, sender_mid, 0, 0)
+                ack_pl = struct.pack("<HHIHHBB", RELAY_SEQ, seq, 0xFFFFFFFF, 1, sender_mid, 0xFF, 0)
                 await ws.send_bytes(b"\xe5\xbe\x00\xb0" + struct.pack("<HBB", 8 + len(ack_pl), 6, 0) + ack_pl)
     finally:
         if my_mid is not None:
