@@ -302,15 +302,21 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                 elif mt == 3:
                     await send_msg(4)
                 elif mt == 5:
+                    if len(pl) >= 6:
+                        uname, _ = _read_str(pl, 4)
+                        if uname:
+                            user_name = uname
                     await send_msg(6, struct.pack(">i", 0))
                 elif mt == 9:
                     await send_msg(10, struct.pack(">i", 0))
                 elif mt == 11:
                     p = 0
                     name, p = _read_str(pl, p)
+                    _flag = pl[p] if p < len(pl) else 0
+                    closed = pl[p + 1] if p + 1 < len(pl) else 0
                     p += 2
-                    max_p = struct.unpack(">i", pl[p : p + 4])[0] if p + 4 <= len(pl) else 4
-                    p += 4
+                    max_p = struct.unpack(">h", pl[p : p + 2])[0] if p + 2 <= len(pl) else 4
+                    p += 2
                     attr, p = _read_blob(pl, p)
                     param, _ = _read_blob(pl, p)
                     if name:
@@ -321,7 +327,7 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                         "id": lid,
                         "name": user_name,
                         "second": user_name,
-                        "closed": 0,
+                        "closed": closed,
                         "max_players": max_p or 4,
                         "attr_blob": attr,
                         "members": [{"name": user_name, "param": param, "ws": ws}],
@@ -339,7 +345,7 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                         out.extend(struct.pack(">ii", 0, 0))
                         ab = r["attr_blob"]
                         out.extend(struct.pack(">h", len(ab)) + ab)
-                    await send_msg(14, bytes(out))
+                    await send_msg(97 if mt == 96 else 14, bytes(out))
                 elif mt == 15:
                     lid = struct.unpack(">i", pl[0:4])[0] if len(pl) >= 4 else 1
                     param, _ = _read_blob(pl, 5)
