@@ -183,7 +183,8 @@ def handle_xplayer_command(raw: str, host: str) -> str:
     if func_id == 17:
         return "f|17|r|s|"
     if func_id in (107, 108):
-        return f"f|{func_id}|r|s|{host}:443|"
+        addr = host if ":" in host else f"{host}:443"
+        return f"f|{func_id}|r|s|{addr}|"
     if func_id == 81:
         uid = kv.get("u", "1")
         conn = sqlite3.connect(DB_PATH)
@@ -209,12 +210,15 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_server_config(request: web.Request) -> web.Response:
     host = request.headers.get("Host") or PUBLIC_HOST
-    base = f"https://{host}"
+    plain = os.environ.get("DH2_LOCAL_PLAIN") == "1"
+    http_scheme = "http" if plain else "https"
+    ws_scheme = "ws" if plain else "wss"
+    base = f"{http_scheme}://{host}"
     reply = (
         "f|1|r|s|"
         f"XplayerURL|{base}/ope/GenericXPlayer_v1.php|"
         "type|1|XPPHPVerNo|4|"
-        f"XPlayMPURL|wss://{host}/ws/lobby|"
+        f"XPlayMPURL|{ws_scheme}://{host}/ws/lobby|"
         f"XplayDWURL|{base}/|"
         f"ChatServer|{host}|ChatDomain|{host}|ChatRoomDomain|conference.{host}|"
         "min|1.0.0|latest|1.1.0|configured|1|"
@@ -233,7 +237,9 @@ async def handle_xplayer(request: web.Request) -> web.Response:
     blob = params.get("b", [""])[0]
     if blob:
         raw = decode_blob(blob)
-        return web.Response(text=handle_xplayer_command(raw, host))
+        resp = handle_xplayer_command(raw, host)
+        print(f"[XPLAYER] req={raw!r} -> resp={resp!r}", flush=True)
+        return web.Response(text=resp)
     return web.Response(text="f|0|r|s|")
 
 
@@ -273,6 +279,7 @@ def _read_blob(buf: bytes, off: int) -> tuple[bytes, int]:
 
 async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
     global NEXT_LOBBY_ID
+    print(f"[WS-LOBBY] connect from {request.remote}", flush=True)
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     user_name = "player"
@@ -281,6 +288,25 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
 
     async def send_msg(mt: int, pl: bytes = b""):
         await ws.send_bytes(pack_lobby(mt, pl))
+
+    async def leave_current_lobby():
+        nonlocal lobby_id
+        if lobby_id and lobby_id in LOBBIES:
+            room = LOBBIES[lobby_id]
+            leaving = [m for m in room["members"] if m["ws"] is ws]
+            room["members"] = [m for m in room["members"] if m["ws"] is not ws]
+            if not room["members"]:
+                LOBBIES.pop(lobby_id, None)
+            elif leaving:
+                room["name"] = room["members"][0]["name"]
+                room["second"] = room["members"][0]["name"]
+                push21 = _pack_str(room["name"]) + _pack_str(leaving[0]["name"])
+                for m in list(room["members"]):
+                    try:
+                        await m["ws"].send_bytes(pack_lobby(21, push21))
+                    except Exception:
+                        pass
+        lobby_id = None
 
     try:
         async for msg in ws:
@@ -297,6 +323,7 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                     continue
                 mt = struct.unpack(">i", body[2:6])[0]
                 pl = body[6:]
+                print(f"[WS-LOBBY] mt={mt} len={len(pl)} user={user_name}", flush=True)
                 if mt == 1:
                     await send_msg(2)
                 elif mt == 3:
@@ -305,7 +332,15 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                     if len(pl) >= 6:
                         uname, _ = _read_str(pl, 4)
                         if uname:
-                            user_name = uname
+                            conn = sqlite3.connect(DB_PATH)
+                            cur = conn.cursor()
+                            cur.execute(
+                                "SELECT username, nickname FROM accounts WHERE uid = ? OR username = ?",
+                                (uname, uname),
+                            )
+                            row = cur.fetchone()
+                            conn.close()
+                            user_name = (row[1] or row[0]) if row else uname
                     await send_msg(6, struct.pack(">i", 0))
                 elif mt == 9:
                     await send_msg(10, struct.pack(">i", 0))
@@ -328,6 +363,7 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                         "name": user_name,
                         "second": user_name,
                         "closed": closed,
+                        "launched": False,
                         "max_players": max_p or 4,
                         "attr_blob": attr,
                         "members": [{"name": user_name, "param": param, "ws": ws}],
@@ -357,6 +393,7 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                     if not any(m["ws"] is ws for m in room["members"]):
                         room["members"].append({"name": user_name, "param": param, "ws": ws})
                     members = room["members"]
+                    is_launched = bool(room.get("launched", False))
                     rep = bytearray(struct.pack(">ii", 0, len(members)))
                     for m in members:
                         rep.extend(_pack_str(m["name"]))
@@ -364,34 +401,45 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                         rep.append(0)
                         rep.extend(_pack_str(m["param"].decode("utf-8", errors="replace")))
                     await send_msg(16, bytes(rep))
-                    push17 = _pack_str(user_name) + _pack_str(user_name) + b"\x00" + _pack_str(param.decode("utf-8", errors="replace"))
+                    push_join = _pack_str(user_name) + _pack_str(user_name) + b"\x00" + _pack_str(param.decode("utf-8", errors="replace"))
+                    push_join_mt = 47 if is_launched else 17
                     for m in members:
                         if m["ws"] is not ws:
-                            await m["ws"].send_bytes(pack_lobby(17, push17))
+                            await m["ws"].send_bytes(pack_lobby(push_join_mt, push_join))
+                    if is_launched:
+                        gs = host_hdr.split(":")[0].encode("utf-8")
+                        gs_port = int(os.environ.get("PORT", "8085")) if os.environ.get("DH2_LOCAL_PLAIN") == "1" else 443
+                        gs_payload = struct.pack(">h", len(gs)) + gs + struct.pack(">hhi", gs_port, gs_port, 1)
+                        await send_msg(44, b"")
+                        await send_msg(50, gs_payload)
+                        print(f"[WS-LOBBY] -> late joiner {user_name} pushed 44+50 gs={gs.decode()}:{gs_port}", flush=True)
                 elif mt == 19:
-                    if lobby_id and lobby_id in LOBBIES:
-                        LOBBIES[lobby_id]["members"] = [m for m in LOBBIES[lobby_id]["members"] if m["ws"] is not ws]
-                        if not LOBBIES[lobby_id]["members"]:
-                            LOBBIES.pop(lobby_id, None)
-                    lobby_id = None
-                    await send_msg(20, struct.pack(">i", 0))
+                    await leave_current_lobby()
+                    try:
+                        await send_msg(20, struct.pack(">i", 0))
+                    except Exception:
+                        pass
+                elif mt == 33:
+                    await send_msg(34, struct.pack(">i", 0))
+                elif mt == 36:
+                    await send_msg(37, struct.pack(">i", 0))
                 elif mt == 39:
                     await send_msg(40, struct.pack(">i", 0))
                 elif mt == 42:
                     await send_msg(43, struct.pack(">i", 0))
-                    gs = host_hdr.encode("utf-8")
-                    gs_payload = struct.pack(">h", len(gs)) + gs + struct.pack(">hhi", 443, 443, 1)
+                    gs = host_hdr.split(":")[0].encode("utf-8")
+                    gs_port = int(os.environ.get("PORT", "8085")) if os.environ.get("DH2_LOCAL_PLAIN") == "1" else 443
+                    gs_payload = struct.pack(">h", len(gs)) + gs + struct.pack(">hhi", gs_port, gs_port, 1)
                     room = LOBBIES.get(lobby_id) if lobby_id else None
+                    if room is not None:
+                        room["launched"] = True
                     targets = [m["ws"] for m in room["members"]] if room else [ws]
                     for t in targets:
                         if t is not ws:
                             await t.send_bytes(pack_lobby(44, b""))
                         await t.send_bytes(pack_lobby(50, gs_payload))
     finally:
-        if lobby_id and lobby_id in LOBBIES:
-            LOBBIES[lobby_id]["members"] = [m for m in LOBBIES[lobby_id]["members"] if m["ws"] is not ws]
-            if not LOBBIES[lobby_id]["members"]:
-                LOBBIES.pop(lobby_id, None)
+        await leave_current_lobby()
     return ws
 
 
@@ -401,6 +449,7 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
 
 async def ws_relay(request: web.Request) -> web.WebSocketResponse:
     global RELAY_SEQ, RELAY_NEXT_MEMBER_ID
+    print(f"[WS-RELAY] connect from {request.remote}", flush=True)
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     my_mid: int | None = None
@@ -424,25 +473,34 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                     RELAY_NEXT_MEMBER_ID += 1
                     RELAY_CLIENTS_BY_NONCE[nonce] = my_mid
                 RELAY_SOCKETS[my_mid] = ws
+                if os.environ.get("DH2_LOCAL_PLAIN") == "1":
+                    print(f"[WS-RELAY] handshake type=5 mid={my_mid} peers={list(RELAY_SOCKETS.keys())}", flush=True)
                 await ws.send_bytes(req[0:8] + b"\x01" + struct.pack("<ii", 1, my_mid) + req[17:])
+            elif pkt_type == 5:
+                for tid, tws in list(RELAY_SOCKETS.items()):
+                    if tid != my_mid:
+                        try:
+                            await tws.send_bytes(req)
+                        except Exception:
+                            pass
             elif pkt_type == 7:
                 await ws.send_bytes(b"\xe5\xbe\x00\xb0\x08\x00\x08\x00")
             elif pkt_type == 6 and len(req) >= 22:
-                seq, _ack, _bits, matching_id, _conn_id = struct.unpack("<HHIHH", req[8:20])
+                seq, ack, bits, matching_id, conn_id = struct.unpack("<HHIHH", req[8:20])
                 sender_mid = my_mid or matching_id
                 msg_data = req[21:]
-                if len(msg_data) > 1 or (len(msg_data) == 1 and msg_data[0] != 0):
-                    for tid, tws in list(RELAY_SOCKETS.items()):
-                        if tid != sender_mid:
-                            RELAY_SEQ = (RELAY_SEQ + 1) & 0xFFFF or 1
-                            fwd_pl = struct.pack("<HHIHHB", RELAY_SEQ, 0, 0, sender_mid, tid, req[20]) + msg_data
-                            await tws.send_bytes(b"\xe5\xbe\x00\xb0" + struct.pack("<HBB", 8 + len(fwd_pl), 6, 0) + fwd_pl)
-                RELAY_SEQ = (RELAY_SEQ + 1) & 0xFFFF or 1
-                ack_pl = struct.pack("<HHIHHBB", RELAY_SEQ, seq, 0xFFFFFFFF, 1, sender_mid, 0xFF, 0)
-                await ws.send_bytes(b"\xe5\xbe\x00\xb0" + struct.pack("<HBB", 8 + len(ack_pl), 6, 0) + ack_pl)
+                verbose_relay = os.environ.get("DH2_LOCAL_PLAIN") == "1" and len(msg_data) > 1
+                for tid, tws in list(RELAY_SOCKETS.items()):
+                    if tid != sender_mid and (conn_id <= 1 or conn_id == tid):
+                        if verbose_relay:
+                            print(f"[WS-RELAY] fwd {sender_mid}->{tid} seq={seq} ack={ack} mask={req[20]} len={len(req)}", flush=True)
+                        fwd_pl = struct.pack("<HHIHHB", seq, ack, bits, sender_mid, tid, req[20]) + msg_data
+                        await tws.send_bytes(b"\xe5\xbe\x00\xb0" + struct.pack("<HBB", 8 + len(fwd_pl), 6, 0) + fwd_pl)
     finally:
         if my_mid is not None:
             RELAY_SOCKETS.pop(my_mid, None)
+            if os.environ.get("DH2_LOCAL_PLAIN") == "1":
+                print(f"[WS-RELAY] disconnect mid={my_mid}", flush=True)
     return ws
 
 
