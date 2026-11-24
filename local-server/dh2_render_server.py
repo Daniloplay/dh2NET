@@ -335,7 +335,7 @@ async def handle_xplayer_command(raw: str, host: str) -> str:
         if rows:
             return f"f|81|r|s|u|{uid}|un|{rows[0][0]}|n|{rows[0][1] or rows[0][0]}|c|{rows[0][2]}|"
         return f"f|81|r|s|u|{uid}|"
-    if func_id == 61:  # GetUserFriends (friends + all currently online players)
+    if func_id == 61:  # GetUserFriends (0x3d: friends + all currently online players)
         uid_str = kv.get("u", "0")
         online_names = _prune_online()
         entries: dict[str, tuple[str, int]] = {}
@@ -356,13 +356,16 @@ async def handle_xplayer_command(raw: str, host: str) -> str:
         for oname in online_names:
             if oname and oname != self_name and oname not in entries:
                 entries[oname] = ("0", 1)
-        parts = [f"f|61|r|s|c|{len(entries)}|"]
-        for idx, (dname, (fuid, st)) in enumerate(entries.items()):
-            parts.append(f"u{idx}|{fuid}|n{idx}|{dname}|s{idx}|{st}|")
+        parts = [f"f|61|r|s|c|{len(entries)}|l|"]
+        for dname, (fuid, st) in entries.items():
+            parts.append(f"{fuid}^{dname}^US^5.0,0,0^0^{st}^DH2^0^EN^^|")
         return "".join(parts)
-    if func_id == 63:  # AddUserFriend
+    if func_id == 73:  # GetUserFriendsCount (0x49)
+        online_names = _prune_online()
+        return f"f|73|r|s|{max(0, len(online_names) - 1)}|"
+    if func_id in (59, 63):  # AddUserFriend (0x3b)
         uid_str = kv.get("u", "0")
-        target = kv.get("n", kv.get("t", "")).strip()
+        target = kv.get("n", kv.get("un", kv.get("t", ""))).strip()
         if target:
             trows = await db_query("SELECT uid FROM accounts WHERE username = ? OR nickname = ?", (target, target))
             if trows:
@@ -370,10 +373,10 @@ async def handle_xplayer_command(raw: str, host: str) -> str:
                     await db_exec("INSERT OR IGNORE INTO friends (uid, friend_uid, status) VALUES (?, ?, 1)", (int(uid_str), int(trows[0][0])))
                 except ValueError:
                     pass
-        return "f|63|r|s|"
-    if func_id == 65:  # RemoveUserFriend
+        return f"f|{func_id}|r|s|"
+    if func_id in (60, 65):  # DelUserFriend (0x3c)
         uid_str = kv.get("u", "0")
-        target = kv.get("n", kv.get("t", "")).strip()
+        target = kv.get("n", kv.get("un", kv.get("t", ""))).strip()
         if target:
             trows = await db_query("SELECT uid FROM accounts WHERE username = ? OR nickname = ?", (target, target))
             if trows:
@@ -381,12 +384,14 @@ async def handle_xplayer_command(raw: str, host: str) -> str:
                     await db_exec("DELETE FROM friends WHERE uid = ? AND friend_uid = ?", (int(uid_str), int(trows[0][0])))
                 except ValueError:
                     pass
-        return "f|65|r|s|"
-    if func_id == 91:  # SendOnlineMessage (game invite)
+        return f"f|{func_id}|r|s|"
+    if func_id == 62:  # ConfirmUserFriend (0x3e)
+        return "f|62|r|s|"
+    if func_id in (77, 91):  # SendOnlineMessage (game invite)
         uid_str = kv.get("u", "0")
-        target = kv.get("d", kv.get("n", "")).strip()
+        target = kv.get("d", kv.get("n", kv.get("un", ""))).strip()
         title = kv.get("t", "title")
-        body = kv.get("m", "")
+        body = kv.get("m", kv.get("o", ""))
         if target:
             srows = await db_query("SELECT username, nickname FROM accounts WHERE uid = ?", (uid_str,))
             sname = (srows[0][1] or srows[0][0]) if srows else uid_str
@@ -397,8 +402,24 @@ async def handle_xplayer_command(raw: str, host: str) -> str:
                 )
             except Exception:
                 pass
-        return "f|91|r|s|"
-    if func_id in (73, 74, 75, 110, 111, 112):
+        return f"f|{func_id}|r|s|"
+    if func_id == 75:  # SendGetMessageHeader (poll incoming game invites)
+        uid_str = kv.get("u", "0")
+        srows = await db_query("SELECT username, nickname FROM accounts WHERE uid = ?", (uid_str,))
+        self_name = (srows[0][1] or srows[0][0]) if srows else ""
+        if not self_name:
+            return "f|75|r|s|c|0|l|"
+        mrows = await db_query(
+            "SELECT id, msg_type, title, sender_name, sender_uid, created_at FROM messages WHERE target_name = ? AND msg_type = 8 AND created_at >= ? ORDER BY id DESC LIMIT 10",
+            (self_name, now - 120),
+        )
+        parts = [f"f|75|r|s|c|{len(mrows)}|l|"]
+        for mid_row, mtype, mtitle, msender, msuid, mcreated in mrows:
+            parts.append(f"{mid_row}^{mtype}^{mtitle or 'title'}^{msender}^{msuid}^{mcreated}^0|")
+        if mrows:
+            await db_exec("DELETE FROM messages WHERE target_name = ? AND msg_type = 8", (self_name,))
+        return "".join(parts)
+    if func_id in (74, 110, 111, 112):
         return f"f|{func_id}|r|s|c|0|"
     return f"{kind}|{func_id}|r|s|"
 
@@ -680,12 +701,10 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
                     print(f"[WS-RELAY] handshake type=5 mid={my_mid} peers={list(RELAY_SOCKETS.keys())}", flush=True)
                 await ws.send_bytes(req[0:8] + b"\x01" + struct.pack("<ii", 1, my_mid) + req[17:])
             elif pkt_type == 5:
-                for tid, tws in list(RELAY_SOCKETS.items()):
-                    if tid != my_mid:
-                        try:
-                            await tws.send_bytes(req)
-                        except Exception:
-                            pass
+                # Never forward a peer's raw type=5 disconnect packet: each client shares member_id=1
+                # with the relay, so forwarding it causes surviving peers to disconnect their own relay.
+                # Lobby mt=21 already notifies surviving peers when a member leaves.
+                pass
             elif pkt_type == 7:
                 await ws.send_bytes(b"\xe5\xbe\x00\xb0\x08\x00\x08\x00")
             elif pkt_type == 6 and len(req) >= 22:
