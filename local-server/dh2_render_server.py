@@ -11,12 +11,14 @@ Routes on 0.0.0.0:$PORT:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import struct
 import time
 import urllib.parse
 
+import aiohttp
 from aiohttp import WSMsgType, web
 
 DB_PATH = os.environ.get(
@@ -24,9 +26,15 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "dh2_online.db"),
 )
 PUBLIC_HOST = os.environ.get("DH2_PUBLIC_HOST", "dh2net.onrender.com")
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+if TURSO_URL.startswith("libsql://"):
+    TURSO_URL = "https://" + TURSO_URL[len("libsql://"):]
 
 LOBBIES: dict[int, dict] = {}
 NEXT_LOBBY_ID = 1
+ONLINE_USERS: dict[str, float] = {}
+TURSO_SESSION: aiohttp.ClientSession | None = None
 
 RELAY_SEQ = 0
 RELAY_NEXT_MEMBER_ID = 2
@@ -84,10 +92,132 @@ def parse_pipe_kv(tokens: list[str]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# SQLite
+# Database (Turso HTTP /v2/pipeline when configured, else local SQLite)
 # ---------------------------------------------------------------------------
 
+def _use_turso() -> bool:
+    return bool(TURSO_URL and TURSO_TOKEN)
+
+
+def _turso_arg(val) -> dict:
+    if val is None:
+        return {"type": "null"}
+    if isinstance(val, int):
+        return {"type": "integer", "value": str(val)}
+    if isinstance(val, float):
+        return {"type": "float", "value": val}
+    return {"type": "text", "value": str(val)}
+
+
+def _turso_val(cell: dict):
+    t = cell.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(cell.get("value", 0))
+    if t == "float":
+        return float(cell.get("value", 0.0))
+    return cell.get("value", "")
+
+
+async def _turso_pipeline(statements: list[tuple[str, tuple]]) -> list[dict]:
+    global TURSO_SESSION
+    if TURSO_SESSION is None or TURSO_SESSION.closed:
+        TURSO_SESSION = aiohttp.ClientSession()
+    reqs = []
+    for sql, args in statements:
+        reqs.append({
+            "type": "execute",
+            "stmt": {"sql": sql, "args": [_turso_arg(a) for a in args]},
+        })
+    reqs.append({"type": "close"})
+    headers = {"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"}
+    async with TURSO_SESSION.post(f"{TURSO_URL}/v2/pipeline", json={"requests": reqs}, headers=headers, timeout=15) as resp:
+        data = await resp.json()
+        return data.get("results", [])
+
+
+async def db_query(sql: str, args: tuple = ()) -> list[tuple]:
+    if _use_turso():
+        res = await _turso_pipeline([(sql, args)])
+        if not res or res[0].get("type") != "ok":
+            return []
+        rows = res[0]["response"]["result"].get("rows", [])
+        return [tuple(_turso_val(c) for c in r) for r in rows]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(sql, args)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+async def db_exec(sql: str, args: tuple = ()) -> int | None:
+    if _use_turso():
+        res = await _turso_pipeline([(sql, args)])
+        if not res or res[0].get("type") != "ok":
+            return None
+        lid = res[0]["response"]["result"].get("last_insert_rowid")
+        return int(lid) if lid is not None else None
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(sql, args)
+    lid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return lid
+
+
+async def init_db_async() -> None:
+    stmts = [
+        ("""CREATE TABLE IF NOT EXISTS accounts (
+            uid INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email TEXT DEFAULT '',
+            country TEXT DEFAULT 'US',
+            nickname TEXT DEFAULT '',
+            created_at INTEGER NOT NULL
+        )""", ()),
+        ("""CREATE TABLE IF NOT EXISTS friends (
+            uid INTEGER NOT NULL,
+            friend_uid INTEGER NOT NULL,
+            status INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (uid, friend_uid)
+        )""", ()),
+        ("""CREATE TABLE IF NOT EXISTS leaderboards (
+            uid INTEGER NOT NULL,
+            board_id INTEGER NOT NULL DEFAULT 0,
+            score INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (uid, board_id)
+        )""", ()),
+        ("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_uid INTEGER NOT NULL,
+            sender_name TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            msg_type INTEGER NOT NULL DEFAULT 8,
+            title TEXT DEFAULT '',
+            body TEXT DEFAULT '',
+            created_at INTEGER NOT NULL
+        )""", ()),
+    ]
+    if _use_turso():
+        await _turso_pipeline(stmts)
+        print(f"[DB] Connected to Turso: {TURSO_URL}", flush=True)
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for sql, _ in stmts:
+        cur.execute(sql)
+    conn.commit()
+    conn.close()
+
+
 def init_db() -> None:
+    if _use_turso():
+        return
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -118,11 +248,31 @@ def init_db() -> None:
             PRIMARY KEY (uid, board_id)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_uid INTEGER NOT NULL,
+            sender_name TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            msg_type INTEGER NOT NULL DEFAULT 8,
+            title TEXT DEFAULT '',
+            body TEXT DEFAULT '',
+            created_at INTEGER NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
 
-def handle_xplayer_command(raw: str, host: str) -> str:
+def _prune_online() -> list[str]:
+    now = time.monotonic()
+    stale = [u for u, ts in ONLINE_USERS.items() if now - ts > 180.0]
+    for u in stale:
+        ONLINE_USERS.pop(u, None)
+    return list(ONLINE_USERS.keys())
+
+
+async def handle_xplayer_command(raw: str, host: str) -> str:
     tokens = raw.split("|")
     if len(tokens) < 2:
         return "f|0|r|e|40|"
@@ -139,19 +289,13 @@ def handle_xplayer_command(raw: str, host: str) -> str:
         password = kv.get("p", "")
         if not username or not password:
             return "f|11|r|e|-100|"
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT uid FROM accounts WHERE username = ?", (username,))
-        if cur.fetchone() is not None:
-            conn.close()
+        rows = await db_query("SELECT uid FROM accounts WHERE username = ?", (username,))
+        if rows:
             return f"f|11|r|e|48|u|{username}|"
-        cur.execute(
+        uid = await db_exec(
             "INSERT INTO accounts (username, password, email, country, nickname, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (username, password, kv.get("e", ""), kv.get("c", "US"), username, now),
         )
-        uid = cur.lastrowid
-        conn.commit()
-        conn.close()
         return f"f|11|r|s|u|{uid}|"
 
     if func_id == 15:  # Login (auto-registers if new)
@@ -159,42 +303,101 @@ def handle_xplayer_command(raw: str, host: str) -> str:
         password = kv.get("p", "")
         if not username:
             return "f|15|r|e|42|"
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT uid, password, nickname FROM accounts WHERE username = ?", (username,))
-        row = cur.fetchone()
-        if row is None:
-            cur.execute(
+        rows = await db_query("SELECT uid, password, nickname FROM accounts WHERE username = ?", (username,))
+        if not rows:
+            uid = await db_exec(
                 "INSERT INTO accounts (username, password, email, country, nickname, created_at) VALUES (?, ?, '', 'US', ?, ?)",
                 (username, password, username, now),
             )
-            uid = cur.lastrowid
-            conn.commit()
-            conn.close()
+            ONLINE_USERS[username] = time.monotonic()
             return f"f|15|r|s|u|{uid}|t|{now}|un|{username}|n|{username}|"
-        conn.close()
-        uid, db_pass, nickname = row
+        uid, db_pass, nickname = rows[0]
         if db_pass != password:
             return "f|15|r|e|43|"
+        ONLINE_USERS[nickname or username] = time.monotonic()
         return f"f|15|r|s|u|{uid}|t|{now}|un|{username}|n|{nickname or username}|"
 
     if func_id == 16:
         return f"f|16|r|s|x|{now}|"
     if func_id == 17:
+        uid = kv.get("u", "")
+        if uid:
+            rows = await db_query("SELECT username, nickname FROM accounts WHERE uid = ? OR username = ?", (uid, uid))
+            if rows:
+                ONLINE_USERS.pop(rows[0][1] or rows[0][0], None)
         return "f|17|r|s|"
     if func_id in (107, 108):
         addr = host if ":" in host else f"{host}:443"
         return f"f|{func_id}|r|s|{addr}|"
     if func_id == 81:
         uid = kv.get("u", "1")
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT username, nickname, country FROM accounts WHERE uid = ? OR username = ?", (uid, uid))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            return f"f|81|r|s|u|{uid}|un|{row[0]}|n|{row[1] or row[0]}|c|{row[2]}|"
+        rows = await db_query("SELECT username, nickname, country FROM accounts WHERE uid = ? OR username = ?", (uid, uid))
+        if rows:
+            return f"f|81|r|s|u|{uid}|un|{rows[0][0]}|n|{rows[0][1] or rows[0][0]}|c|{rows[0][2]}|"
         return f"f|81|r|s|u|{uid}|"
+    if func_id == 61:  # GetUserFriends (friends + all currently online players)
+        uid_str = kv.get("u", "0")
+        online_names = _prune_online()
+        entries: dict[str, tuple[str, int]] = {}
+        try:
+            uid_int = int(uid_str)
+        except ValueError:
+            uid_int = 0
+        self_rows = await db_query("SELECT username, nickname FROM accounts WHERE uid = ?", (uid_int,))
+        self_name = (self_rows[0][1] or self_rows[0][0]) if self_rows else ""
+        friend_rows = await db_query(
+            "SELECT a.uid, a.username, a.nickname FROM friends f JOIN accounts a ON a.uid = f.friend_uid WHERE f.uid = ?",
+            (uid_int,),
+        )
+        for fuid, funame, fnick in friend_rows:
+            dname = fnick or funame
+            if dname and dname != self_name:
+                entries[dname] = (str(fuid), 1 if dname in online_names else 0)
+        for oname in online_names:
+            if oname and oname != self_name and oname not in entries:
+                entries[oname] = ("0", 1)
+        parts = [f"f|61|r|s|c|{len(entries)}|"]
+        for idx, (dname, (fuid, st)) in enumerate(entries.items()):
+            parts.append(f"u{idx}|{fuid}|n{idx}|{dname}|s{idx}|{st}|")
+        return "".join(parts)
+    if func_id == 63:  # AddUserFriend
+        uid_str = kv.get("u", "0")
+        target = kv.get("n", kv.get("t", "")).strip()
+        if target:
+            trows = await db_query("SELECT uid FROM accounts WHERE username = ? OR nickname = ?", (target, target))
+            if trows:
+                try:
+                    await db_exec("INSERT OR IGNORE INTO friends (uid, friend_uid, status) VALUES (?, ?, 1)", (int(uid_str), int(trows[0][0])))
+                except ValueError:
+                    pass
+        return "f|63|r|s|"
+    if func_id == 65:  # RemoveUserFriend
+        uid_str = kv.get("u", "0")
+        target = kv.get("n", kv.get("t", "")).strip()
+        if target:
+            trows = await db_query("SELECT uid FROM accounts WHERE username = ? OR nickname = ?", (target, target))
+            if trows:
+                try:
+                    await db_exec("DELETE FROM friends WHERE uid = ? AND friend_uid = ?", (int(uid_str), int(trows[0][0])))
+                except ValueError:
+                    pass
+        return "f|65|r|s|"
+    if func_id == 91:  # SendOnlineMessage (game invite)
+        uid_str = kv.get("u", "0")
+        target = kv.get("d", kv.get("n", "")).strip()
+        title = kv.get("t", "title")
+        body = kv.get("m", "")
+        if target:
+            srows = await db_query("SELECT username, nickname FROM accounts WHERE uid = ?", (uid_str,))
+            sname = (srows[0][1] or srows[0][0]) if srows else uid_str
+            try:
+                await db_exec(
+                    "INSERT INTO messages (sender_uid, sender_name, target_name, msg_type, title, body, created_at) VALUES (?, ?, ?, 8, ?, ?, ?)",
+                    (int(uid_str) if uid_str.isdigit() else 0, sname, target, title, body, now),
+                )
+            except Exception:
+                pass
+        return "f|91|r|s|"
     if func_id in (73, 74, 75, 110, 111, 112):
         return f"f|{func_id}|r|s|c|0|"
     return f"{kind}|{func_id}|r|s|"
@@ -237,7 +440,7 @@ async def handle_xplayer(request: web.Request) -> web.Response:
     blob = params.get("b", [""])[0]
     if blob:
         raw = decode_blob(blob)
-        resp = handle_xplayer_command(raw, host)
+        resp = await handle_xplayer_command(raw, host)
         print(f"[XPLAYER] req={raw!r} -> resp={resp!r}", flush=True)
         return web.Response(text=resp)
     return web.Response(text="f|0|r|s|")
@@ -332,17 +535,17 @@ async def ws_lobby(request: web.Request) -> web.WebSocketResponse:
                     if len(pl) >= 6:
                         uname, _ = _read_str(pl, 4)
                         if uname:
-                            conn = sqlite3.connect(DB_PATH)
-                            cur = conn.cursor()
-                            cur.execute(
+                            rows = await db_query(
                                 "SELECT username, nickname FROM accounts WHERE uid = ? OR username = ?",
                                 (uname, uname),
                             )
-                            row = cur.fetchone()
-                            conn.close()
+                            row = rows[0] if rows else None
                             user_name = (row[1] or row[0]) if row else uname
+                    ONLINE_USERS[user_name] = time.monotonic()
                     await send_msg(6, struct.pack(">i", 0))
                 elif mt == 9:
+                    if user_name and user_name != "player":
+                        ONLINE_USERS[user_name] = time.monotonic()
                     await send_msg(10, struct.pack(">i", 0))
                 elif mt == 11:
                     p = 0
@@ -507,6 +710,16 @@ async def ws_relay(request: web.Request) -> web.WebSocketResponse:
 def create_app() -> web.Application:
     init_db()
     app = web.Application()
+
+    async def _on_startup(_app: web.Application) -> None:
+        await init_db_async()
+
+    async def _on_cleanup(_app: web.Application) -> None:
+        if TURSO_SESSION is not None and not TURSO_SESSION.closed:
+            await TURSO_SESSION.close()
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
     app.router.add_get("/", handle_health)
     app.router.add_route("*", "/ope/ServerConfig.php", handle_server_config)
     app.router.add_route("*", "/ope/GenericXPlayer_v1.php", handle_xplayer)
